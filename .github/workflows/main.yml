@@ -1,0 +1,108 @@
+name: Xray VLESS Server (TryCloudflare)
+
+on:
+  workflow_dispatch: # Allows you to run this workflow manually from the Actions tab
+
+jobs:
+  run-server:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Xray-core
+        run: |
+          bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+
+      - name: Generate UUID and Prepare Xray Config
+        id: xray_setup
+        run: |
+          UUID=$(xray uuid)
+          WSPATH="/$(openssl rand -hex 8)"
+          echo "UUID=$UUID" >> $GITHUB_OUTPUT
+          echo "WSPATH=$WSPATH" >> $GITHUB_OUTPUT
+          
+          # Create a minimal Xray config for VLESS + WebSocket
+          cat > /usr/local/etc/xray/config.json <<EOF
+          {
+            "inbounds": [{
+              "port": 8080,
+              "listen": "127.0.0.1",
+              "protocol": "vless",
+              "settings": {
+                "clients": [{"id": "$UUID"}],
+                "decryption": "none"
+              },
+              "streamSettings": {
+                "network": "ws",
+                "wsSettings": {"path": "$WSPATH"}
+              }
+            }],
+            "outbounds": [{"protocol": "freedom"}]
+          }
+          EOF
+
+      - name: Start Xray in Background
+        run: |
+          systemctl start xray
+          # Brief pause to ensure the service is listening
+          sleep 2
+
+      - name: Setup cloudflared
+        uses: AnimMouse/setup-cloudflared@v2
+
+      - name: Start Quick Tunnel and Capture URL
+        id: tunnel
+        run: |
+          # Start cloudflared in the background, logging to a file
+          nohup cloudflared tunnel --url http://127.0.0.1:8080 --logfile /tmp/argo.log > /dev/null 2>&1 &
+          
+          # Wait for the random trycloudflare.com URL to appear in the log
+          for i in {1..15}; do
+            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/argo.log | head -n 1)
+            if [ -n "$URL" ]; then
+              break
+            fi
+            sleep 1
+          done
+          
+          if [ -z "$URL" ]; then
+            echo "Failed to obtain trycloudflare URL."
+            cat /tmp/argo.log
+            exit 1
+          fi
+          
+          # Extract just the domain (e.g., random-words.trycloudflare.com)
+          DOMAIN=$(echo $URL | sed 's|https://||')
+          echo "DOMAIN=$DOMAIN" >> $GITHUB_OUTPUT
+
+      - name: Print VLESS Configuration
+        run: |
+          DOMAIN="${{ steps.tunnel.outputs.DOMAIN }}"
+          UUID="${{ steps.xray_setup.outputs.UUID }}"
+          WSPATH="${{ steps.xray_setup.outputs.WSPATH }}"
+          
+          echo "======================================================="
+          echo "✅ VLESS Configuration Generated Successfully"
+          echo "======================================================="
+          echo ""
+          echo "🔹 Server Address: $DOMAIN"
+          echo "🔹 Port: 443"
+          echo "🔹 UUID: $UUID"
+          echo "🔹 Transport: ws (WebSocket)"
+          echo "🔹 Path: $WSPATH"
+          echo "🔹 TLS: tls"
+          echo "🔹 SNI: $DOMAIN"
+          echo ""
+          echo "📋 VLESS URL (Import this into v2rayNG / v2rayN):"
+          echo "vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}&type=ws&host=${DOMAIN}&path=${WSPATH}#GitHubActions-TryCloudflare"
+          echo ""
+          echo "⚠️ Note: This tunnel is ephemeral. The configuration is only valid while this workflow job is running."
+          echo "======================================================="
+
+      - name: Keep Job Alive (Optional)
+        run: |
+          # The job will remain active for a maximum of 6 hours (GitHub Actions limit) or until cancelled manually.
+          # This ensures the proxy stays online for as long as possible.
+          echo "Server is running. Cancel the workflow to stop the tunnel."
+          sleep 21600 # 6 hours
